@@ -1,0 +1,154 @@
+// ------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+// ------------------------------------------------------------------------------------------------
+
+namespace System.Test.Environment;
+
+using System.Environment;
+using System.TestLibraries.Environment;
+using System.TestLibraries.Utilities;
+
+codeunit 135091 "Environment Information Test"
+{
+    Subtype = Test;
+    TestPermissions = Disabled;
+
+    var
+        Assert: Codeunit "Library Assert";
+        EnvironmentInformation: Codeunit "Environment Information";
+        EnvironmentInfoTestLibrary: Codeunit "Environment Info Test Library";
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestCanStartSessionWithTestIsolationEnabled()
+    begin
+        // [Scenario] When running the tests with the test isolation enabled (the default), CanStartSession returns false.
+        // [Given] The test codeunit is executed by a test runner with enabled test isolation
+        // [Then] CanStartSession returns false
+        Assert.IsFalse(EnvironmentInformation.CanStartSession(), 'CanStartSession() should return false if test isolation is enabled.');
+    end;
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestIsSandboxIsTrueWhenTestabilitySandboxIsSet()
+    begin
+        // [Scenario] Set the testability to true. IsSandBox returns correct values.
+
+        // [Given] Set the testability sandbox to True
+        EnvironmentInfoTestLibrary.SetTestabilitySandbox(true);
+
+        // [When] Poll for IsSandbox
+        // [Then] Should return true
+        Assert.IsTrue(EnvironmentInformation.IsSandbox(), 'Testability should have dictacted a sandbox environment');
+    end;
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestIsSandboxIsFalseWhenTestabilitySandboxIsNotSet()
+    begin
+        // [Scenario] Set the testability to false. IsSandBox returns correct values.
+
+        // [Given] Set the testability sandbox to false
+        EnvironmentInfoTestLibrary.SetTestabilitySandbox(false);
+
+        // [When] Poll for IsSandbox
+        // [Then] Should return false
+        Assert.IsFalse(EnvironmentInformation.IsSandbox(), 'Testability should have dictacted a non-sandbox environment');
+    end;
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestIsSaaSIsTrueWhenTestabilitySaaSIsSet()
+    begin
+        // [SCENARIO] Set the testability to true. IsSaaS returns correct values.
+
+        // [Given] Set the testability SaaS to true
+        EnvironmentInfoTestLibrary.SetTestabilitySoftwareAsAService(true);
+
+        // [When] Poll for IsSaaS
+        // [Then] Should return true
+        Assert.IsTrue(EnvironmentInformation.IsSaaS(), 'Testability should have dictacted a SaaS environment');
+    end;
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestIsSaaSIsFalseWhenTestabilitySaaSIsNotSet()
+    begin
+        // [SCENARIO] Set the testability to false. IsSaaS returns correct values.
+
+        // [Given] Set the testability SaaS to false
+        EnvironmentInfoTestLibrary.SetTestabilitySoftwareAsAService(false);
+
+        // [When] Poll for IsSaaS
+        // [Then] Should return false
+        Assert.IsFalse(EnvironmentInformation.IsSaaS(), 'Testability should have dictacted a non- SaaS environment');
+    end;
+
+    [Test]
+    [Scope('OnPrem')]
+    procedure TestIsEarlyPreviewVersionIsSet()
+    begin
+        // [SCENARIO] Set the testability to true. IsEarlyPreview returns correct value.
+
+        // [Given] Set the testability early preview to true
+        EnvironmentInfoTestLibrary.SetTestabilityEarlyPreview(true);
+
+        // [When] Poll for IsEarlyPreview
+        // [Then] Should return true
+        Assert.IsTrue(EnvironmentInformation.IsEarlyPreview(), 'Testability should have dictated an early preview environment');
+    end;
+
+    [Test]
+    procedure TestEnvironmentDescriptionIsClearedAfterEnvironmentCopy()
+    var
+        EnvironmentTriggers: Codeunit "Environment Triggers";
+    begin
+        // [Given] The source environment has a description
+        EnvironmentInformation.SetEnvironmentDescription('Source environment description');
+
+        // [When] The environment is copied
+        EnvironmentTriggers.OnAfterCopyEnvironmentPerDatabase(0, 'Source', 1, 'Destination');
+
+        // [Then] The destination environment description is empty
+        Assert.AreEqual('', EnvironmentInformation.GetEnvironmentDescription(), 'The environment description should be cleared after copying the environment.');
+    end;
+
+    [Test]
+    procedure TestEnvironmentDescriptionIsProvidedToPlatform()
+    var
+        SystemActionTriggers: Codeunit "System Action Triggers";
+        DescriptionBuilder: TextBuilder;
+        ExpectedDescription: Text;
+        Description: Text;
+    begin
+        // [Given] The environment has a long, multiline description.
+        DescriptionBuilder.AppendLine(PadStr('Production environment ', 1024, 'x'));
+        DescriptionBuilder.Append('Italian sales');
+        ExpectedDescription := DescriptionBuilder.ToText();
+        EnvironmentInformation.SetEnvironmentDescription(ExpectedDescription);
+
+        // [When] The platform requests the environment description.
+        SystemActionTriggers.GetEnvironmentDescription(Description);
+
+        // [Then] The complete description is returned.
+        Assert.AreEqual(ExpectedDescription, Description, 'The platform should receive the complete environment description.');
+    end;
+
+    [Test]
+    procedure TestEmptyEnvironmentDescriptionIsProvidedToPlatform()
+    var
+        SystemActionTriggers: Codeunit "System Action Triggers";
+        Description: Text;
+    begin
+        // [Given] No environment description is configured.
+        EnvironmentInformation.SetEnvironmentDescription('');
+        Description := 'Previous description';
+
+        // [When] The platform requests the environment description.
+        SystemActionTriggers.GetEnvironmentDescription(Description);
+
+        // [Then] A stale description is not returned.
+        Assert.AreEqual('', Description, 'The platform should receive an empty environment description.');
+    end;
+}

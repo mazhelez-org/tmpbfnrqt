@@ -1,0 +1,351 @@
+﻿// ------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+// ------------------------------------------------------------------------------------------------
+namespace Microsoft.QualityManagement.Dispositions.Transfer;
+
+using Microsoft.Inventory.Location;
+using Microsoft.QualityManagement.Dispositions;
+using Microsoft.QualityManagement.Document;
+using Microsoft.Warehouse.Structure;
+
+report 20410 "Qlty. Create Transfer Order"
+{
+    Caption = 'Quality Management - Create Transfer Order';
+    ToolTip = 'Use this to transfer items to another location.';
+    ProcessingOnly = true;
+    AccessByPermission = tabledata "Qlty. Inspection Header" = R;
+    UsageCategory = Tasks;
+    ApplicationArea = QualityManagement;
+    AllowScheduling = false;
+
+    dataset
+    {
+        dataitem(CurrentInspection; "Qlty. Inspection Header")
+        {
+            RequestFilterFields = "No.", "Re-inspection No.", "Source Item No.", "Source Variant Code", "Source Lot No.", "Source Serial No.", "Source Package No.", "Source Document No.", "Template Code";
+
+            trigger OnAfterGetRecord()
+            var
+                QltyDispTransfer: Codeunit "Qlty. Disp. Transfer";
+            begin
+                QltyDispTransfer.PerformDisposition(CurrentInspection, SpecificQuantity, QltyQuantityBehavior, FilterOfSourceLocation, FilterOfSourceBin, Destination, DestinationBin, InTransit);
+            end;
+        }
+    }
+
+    requestpage
+    {
+        AboutTitle = 'About Creating a Transfer';
+        AboutText = 'Use this to transfer inventory from an inspectioning location to another location.';
+
+        layout
+        {
+            area(Content)
+            {
+                group(Quantity)
+                {
+                    Caption = 'Quantity';
+                    InstructionalText = 'The quantity of the item that will be transferred to another location.';
+
+                    field(ChooseMoveTracked; MoveTracked)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Entire Lot/Serial/Package';
+                        ToolTip = 'Uses all posted inventory that matches the lot, serial, or package number on the inspection and any source filters. The item and inspection must include item tracking.';
+
+                        trigger OnValidate()
+                        begin
+                            if MoveTracked then begin
+                                QltyQuantityBehavior := QltyQuantityBehavior::"Item Tracked Quantity";
+                                MoveSpecific := false;
+                                MoveSampleSize := false;
+                                MovePassed := false;
+                                MoveFailed := false;
+                            end else
+                                if QltyQuantityBehavior = QltyQuantityBehavior::"Item Tracked Quantity" then
+                                    MoveTracked := true;
+
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                    field(ChooseMoveSpecificQuantity; MoveSpecific)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Specific Quantity';
+                        ToolTip = 'Uses Quantity to Handle. If it is 0, uses Quantity (Base) from the inspection. The resulting quantity must be greater than 0.';
+
+                        trigger OnValidate()
+                        begin
+                            if MoveSpecific then begin
+                                QltyQuantityBehavior := QltyQuantityBehavior::"Specific Quantity";
+                                MoveTracked := false;
+                                MoveSampleSize := false;
+                                MovePassed := false;
+                                MoveFailed := false;
+                            end else
+                                if QltyQuantityBehavior = QltyQuantityBehavior::"Specific Quantity" then
+                                    MoveSpecific := true;
+
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                    group(SpecificQty)
+                    {
+                        ShowCaption = false;
+                        Visible = MoveSpecific;
+
+                        field(ChooseQuantity; SpecificQuantity)
+                        {
+                            ApplicationArea = All;
+                            Caption = 'Quantity to Handle';
+                            ToolTip = 'Specifies the quantity for Specific Quantity. Enter 0 to use Quantity (Base) from the inspection.';
+                            AutoFormatType = 0;
+                            DecimalPlaces = 0 : 5;
+                            ShowMandatory = true;
+                            Enabled = MoveSpecific;
+                        }
+                    }
+                    field(ChooseMoveSampleSize; MoveSampleSize)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Sample Quantity';
+                        ToolTip = 'Uses Sample Size from the inspection. Sample Size must be greater than 0.';
+
+                        trigger OnValidate()
+                        begin
+                            if MoveSampleSize then begin
+                                QltyQuantityBehavior := QltyQuantityBehavior::"Sample Quantity";
+                                MoveTracked := false;
+                                MoveSpecific := false;
+                                MovePassed := false;
+                                MoveFailed := false;
+                            end else
+                                if QltyQuantityBehavior = QltyQuantityBehavior::"Sample Quantity" then
+                                    MoveSampleSize := true;
+
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                    field(ChooseMoveSamplePass; MovePassed)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Passed Quantity';
+                        ToolTip = 'Uses Passed Quantity from the inspection. Passed Quantity must be greater than 0.';
+
+                        trigger OnValidate()
+                        begin
+                            if MovePassed then begin
+                                QltyQuantityBehavior := QltyQuantityBehavior::"Passed Quantity";
+                                MoveTracked := false;
+                                MoveSpecific := false;
+                                MoveSampleSize := false;
+                                MoveFailed := false;
+                            end else
+                                if QltyQuantityBehavior = QltyQuantityBehavior::"Passed Quantity" then
+                                    MovePassed := true;
+
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                    field(ChooseMoveSampleFail; MoveFailed)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Failed Quantity';
+                        ToolTip = 'Uses Failed Quantity from the inspection. Failed Quantity must be greater than 0.';
+
+                        trigger OnValidate()
+                        begin
+                            if MoveFailed then begin
+                                QltyQuantityBehavior := QltyQuantityBehavior::"Failed Quantity";
+                                MoveTracked := false;
+                                MoveSpecific := false;
+                                MoveSampleSize := false;
+                                MovePassed := false;
+                            end else
+                                if QltyQuantityBehavior = QltyQuantityBehavior::"Failed Quantity" then
+                                    MoveFailed := true;
+
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                }
+                group(Source)
+                {
+                    Caption = 'Source (optional)';
+                    InstructionalText = 'Optional filters that limit where the inventory is transferred from if the inspection covers more than one bin.';
+
+                    field(ChooseSourceLocationFilter; FilterOfSourceLocation)
+                    {
+                        ApplicationArea = All;
+                        TableRelation = Location.Code;
+                        Caption = 'Location Filter';
+                        ToolTip = 'Specifies to optionally restrict the location from which the inventory will be transferred.';
+                    }
+                    field(ChooseSourceBinFilter; FilterOfSourceBin)
+                    {
+                        ApplicationArea = All;
+                        TableRelation = Bin.Code;
+                        Caption = 'Bin Filter';
+                        ToolTip = 'Specifies to optionally restrict the bin from which the inventory will be transferred.';
+                    }
+                }
+                group(GroupDestination)
+                {
+                    Caption = 'Destination';
+                    InstructionalText = 'The location where the inventory will be transferred.';
+
+                    field(ChooseDestinationLocation; Destination)
+                    {
+                        ApplicationArea = All;
+                        TableRelation = Location.Code;
+                        Caption = 'Location';
+                        ToolTip = 'Specifies the location where the inventory will be transferred.';
+                        ShowMandatory = true;
+
+                        trigger OnValidate()
+                        begin
+                            UpdateDestinationBinState();
+                            CurrReport.RequestOptionsPage.Update(true);
+                        end;
+                    }
+                    field(ChooseDestinationBin; DestinationBin)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Bin';
+                        ToolTip = 'Specifies the bin at the destination location where the inventory will be transferred.';
+                        Enabled = ShowDestinationBin;
+
+                        trigger OnLookup(var Text: Text): Boolean
+                        var
+                            Bin: Record Bin;
+                            BinList: Page "Bin List";
+                        begin
+                            if Destination = '' then
+                                exit(false);
+
+                            Bin.SetRange("Location Code", Destination);
+                            BinList.SetTableView(Bin);
+                            BinList.LookupMode(true);
+                            if BinList.RunModal() <> Action::LookupOK then
+                                exit(false);
+
+                            BinList.GetRecord(Bin);
+                            Text := Bin.Code;
+                            exit(true);
+                        end;
+
+                        trigger OnValidate()
+                        var
+                            Bin: Record Bin;
+                        begin
+                            if DestinationBin = '' then
+                                exit;
+
+                            Bin.Get(Destination, DestinationBin);
+                        end;
+                    }
+                }
+                group(Transfer)
+                {
+                    Caption = 'Transfer Details';
+                    InstructionalText = 'If the in-transit code is blank and no Transfer Route between the locations has been defined, the transfer will be direct. If the in-transit code is blank and a Transfer Route is defined, the Transfer Route''s in-transit location will be used.';
+
+                    field(ChooseDirectTransfer; DirectTransfer)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'Direct Transfer';
+                        ToolTip = 'Specifies that the transfer does not use an in-transit location';
+
+                        trigger OnValidate()
+                        begin
+                            if DirectTransfer then
+                                InTransit := '';
+                        end;
+                    }
+                    field(ChooseInTransitCode; InTransit)
+                    {
+                        ApplicationArea = All;
+                        Caption = 'In-Transit Code';
+                        ToolTip = 'Specifies the in-transit location. Leave blank for a direct transfer or to use the Transfer Route.';
+                        TableRelation = Location.Code where("Use As In-Transit" = const(true));
+                        Enabled = not DirectTransfer;
+                    }
+                }
+            }
+        }
+
+        trigger OnOpenPage()
+        begin
+            UpdateDestinationBinState();
+        end;
+
+        trigger OnQueryClosePage(CloseAction: Action): Boolean
+        begin
+            if CloseAction = Action::OK then
+                ValidateDestinationBin();
+        end;
+    }
+
+    var
+        QltyQuantityBehavior: Enum "Qlty. Quantity Behavior";
+        SpecificQuantity: Decimal;
+        FilterOfSourceLocation: Code[100];
+        FilterOfSourceBin: Code[100];
+        MoveTracked: Boolean;
+        MoveSpecific: Boolean;
+        MoveSampleSize: Boolean;
+        MovePassed: Boolean;
+        MoveFailed: Boolean;
+        Destination: Code[10];
+        DestinationBin: Code[20];
+        InTransit: Code[10];
+        DirectTransfer: Boolean;
+        ShowDestinationBin: Boolean;
+
+    trigger OnInitReport()
+    begin
+        MoveSpecific := true;
+    end;
+
+    trigger OnPreReport()
+    begin
+        ValidateDestinationBin();
+    end;
+
+    local procedure UpdateDestinationBinState()
+    var
+        Bin: Record Bin;
+        DestinationLocation: Record Location;
+    begin
+        ShowDestinationBin := false;
+        if DestinationLocation.Get(Destination) then
+            ShowDestinationBin := DestinationLocation."Bin Mandatory" and not DestinationLocation."Directed Put-away and Pick";
+        if DestinationBin = '' then
+            exit;
+
+        if not ShowDestinationBin then begin
+            Clear(DestinationBin);
+            exit;
+        end;
+
+        if not Bin.Get(Destination, DestinationBin) then
+            Clear(DestinationBin);
+    end;
+
+    local procedure ValidateDestinationBin()
+    var
+        Bin: Record Bin;
+        DestinationLocation: Record Location;
+    begin
+        if DestinationBin = '' then
+            exit;
+
+        if not DestinationLocation.Get(Destination) then
+            exit;
+        if not DestinationLocation."Bin Mandatory" or DestinationLocation."Directed Put-away and Pick" then
+            exit;
+
+        Bin.Get(Destination, DestinationBin);
+    end;
+}

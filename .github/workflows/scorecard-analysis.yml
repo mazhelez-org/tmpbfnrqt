@@ -1,0 +1,39 @@
+name: Scorecard analysis
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly on Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    if: github.repository_owner == 'microsoft'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # Needed for Code scanning upload
+      id-token: write # Needed for GitHub OIDC token if publish_results is true
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: "Checkout code"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Run analysis"
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+
+      - name: "Upload to code-scanning"
+        uses: github/codeql-action/upload-sarif@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v3.30.8
+        with:
+          sarif_file: results.sarif

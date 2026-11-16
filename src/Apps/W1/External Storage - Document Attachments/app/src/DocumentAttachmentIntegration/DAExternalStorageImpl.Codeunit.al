@@ -1,0 +1,1136 @@
+// ------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+// ------------------------------------------------------------------------------------------------
+
+namespace Microsoft.ExternalStorage.DocumentAttachments;
+
+using Microsoft.Foundation.Attachment;
+using System.Environment;
+using System.ExternalFileStorage;
+using System.Security.Encryption;
+using System.Utilities;
+
+codeunit 8751 "DA External Storage Impl." implements "File Scenario"
+{
+    Access = Internal;
+    InherentPermissions = X;
+    InherentEntitlements = X;
+    Permissions = tabledata "Tenant Media" = rimd,
+                  tabledata "Document Attachment" = rimd,
+                  tabledata "File Account" = r,
+                  tabledata "DA External Storage Setup" = r;
+
+    var
+        LastCreatedExternalFilePath: Text[2048];
+        LastFailureReasonSafeForTelemetry: Boolean;
+        CannotRetrieveExternalFileErr: Label 'The file %1 could not be retrieved from external storage. Verify that the file exists and that the external file storage account is configured and accessible.', Comment = '%1 = File name';
+        FeatureDisabledErr: Label 'External storage is not enabled.';
+        NoInternalContentErr: Label 'The attachment has no file content in internal storage.';
+        InternalContentNotFoundErr: Label 'The attachment content could not be found in internal storage.';
+        AlreadyUploadedErr: Label 'The attachment already references a file in external storage.';
+        NotStoredExternallyErr: Label 'The attachment is not stored in external storage.';
+        NoFileAccountErr: Label 'No file account is assigned to the %1 file scenario.', Comment = '%1 = File scenario name';
+        ExternalOperationFailedErr: Label 'The external storage operation failed.';
+        ExternalDeletionBlockedMsg: Label 'Remote file deletion is blocked. You can retire a local external reference only after its internal file content has been confirmed. Use Storage Sync with To Internal Storage and Move, or restore with Copy and then Retire External Reference. Remote files remain retained; no remote cleanup is scheduled.';
+        RetirementFeatureDisabledErr: Label 'Enable External Storage before retiring an external reference.';
+        RetirementRecordMissingErr: Label 'The attachment is temporary or no longer exists. No external metadata was changed.';
+        RetirementReferenceChangedErr: Label 'The attachment content or external reference has changed. Refresh the attachment before retiring its external reference.';
+        RetirementExternalReferenceMissingErr: Label 'The attachment no longer has an external reference to retire.';
+        RetirementInternalContentMissingErr: Label 'The attachment does not have confirmed nonempty internal content. Use Storage Sync to restore it to internal storage before retiring its external reference.';
+        EmptyExternalRestoreErr: Label 'The external file returned no content. Existing internal content and external metadata were not changed.';
+
+    #region File Scenario Interface Implementation
+    /// <summary>
+    /// Called before adding or modifying a file scenario.
+    /// </summary>
+    /// <param name="Scenario">The ID of the file scenario.</param>
+    /// <param name="Connector">The file storage connector.</param>
+    /// <returns>True if the operation is allowed, otherwise false.</returns>
+    procedure BeforeAddOrModifyFileScenarioCheck(Scenario: Enum "File Scenario"; Connector: Enum "Ext. File Storage Connector"): Boolean;
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        TempFileAccount: Record "File Account";
+        FileScenarioCU: Codeunit "File Scenario";
+        ConfirmManagement: Codeunit "Confirm Management";
+        ExternalStorageSetupPage: Page "DA External Storage Setup";
+        CannotReassignScenarioErr: Label 'You cannot change the file storage account while External Storage is enabled and attachments reference external files.\\To change the storage account:\1. Use Storage Sync with To Internal Storage and Move to restore content and retire local external references. Remote files are retained.\2. Disable the External Storage feature.\3. Reassign the file scenario to the new storage account.\4. Re-enable the feature and sync files to the new storage.';
+        ConfigureExternalStorageQst: Label 'Do you want to configure External Storage settings now?';
+    begin
+        if not (Scenario = Enum::"File Scenario"::"Doc. Attach. - External Storage") then
+            exit;
+
+        // Check if scenario is already assigned to a different account
+        if FileScenarioCU.GetSpecificFileAccount(Scenario, TempFileAccount) then
+            // If feature is enabled and has uploaded files, don't allow reassignment
+            if ExternalStorageSetup.Get() then
+                if ExternalStorageSetup.Enabled then begin
+                    ExternalStorageSetup.CalcFields("Has Uploaded Files");
+                    if ExternalStorageSetup."Has Uploaded Files" then begin
+                        Message(CannotReassignScenarioErr);
+                        exit(true);
+                    end;
+                end;
+
+        // Open setup page for additional configuration automatically
+        if ConfirmManagement.GetResponseOrDefault(ConfigureExternalStorageQst, true) then
+            ExternalStorageSetupPage.Run();
+        exit(false);
+    end;
+
+    /// <summary>
+    /// Called to get additional setup for a file scenario.
+    /// </summary>
+    /// <param name="Scenario">The ID of the file scenario.</param>
+    /// <param name="Connector">The file storage connector.</param>
+    /// <returns>True if additional setup is available, otherwise false.</returns>
+    procedure GetAdditionalScenarioSetup(Scenario: Enum "File Scenario"; Connector: Enum "Ext. File Storage Connector"): Boolean;
+    var
+        ExternalStorageSetup: Page "DA External Storage Setup";
+    begin
+        if not (Scenario = Enum::"File Scenario"::"Doc. Attach. - External Storage") then
+            exit;
+
+        ExternalStorageSetup.RunModal();
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Called before deleting a file scenario.
+    /// </summary>
+    /// <param name="Scenario">The ID of the file scenario.</param>
+    /// <param name="Connector">The file storage connector.</param>
+    /// <returns>True if the delete operation is handled and should not proceed, otherwise false.</returns>
+    procedure BeforeDeleteFileScenarioCheck(Scenario: Enum "File Scenario"; Connector: Enum "Ext. File Storage Connector"): Boolean;
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        NotPossibleToUnassignScenarioMsg: Label 'External Storage cannot be unassigned while attachments reference external files. Use Storage Sync with To Internal Storage and Move to restore content and retire local external references. Remote files are retained.';
+    begin
+        if not (Scenario = Enum::"File Scenario"::"Doc. Attach. - External Storage") then
+            exit;
+
+        if not ExternalStorageSetup.Get() then
+            exit;
+
+        ExternalStorageSetup.CalcFields("Has Uploaded Files");
+        if not ExternalStorageSetup."Has Uploaded Files" then
+            exit;
+
+        Message(NotPossibleToUnassignScenarioMsg);
+        exit(true);
+    end;
+
+    procedure BeforeReassignFileScenarioCheck(Scenario: Enum "File Scenario"): Boolean
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        NotPossibleToReassignScenarioMsg: Label 'External Storage cannot be reassigned while attachments reference external files. Use Storage Sync with To Internal Storage and Move to restore content and retire local external references. Remote files are retained.';
+    begin
+        if not (Scenario = Enum::"File Scenario"::"Doc. Attach. - External Storage") then
+            exit;
+
+        if not ExternalStorageSetup.Get() then
+            exit;
+
+        ExternalStorageSetup.CalcFields("Has Uploaded Files");
+        if not ExternalStorageSetup."Has Uploaded Files" then
+            exit;
+
+        Message(NotPossibleToReassignScenarioMsg);
+        exit(true);
+    end;
+    #endregion
+
+    /// <summary>
+    /// Provides functionality to manage document attachments in external storage systems.
+    /// Handles upload, download, and deletion operations for Business Central attachments.
+    /// </summary>
+    #region External Storage Operations
+    /// <summary>
+    /// Uploads a document attachment to external storage.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to upload.</param>
+    /// <returns>True if upload was successful, false otherwise.</returns>
+    procedure UploadToExternalStorage(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        FailureReason: Text;
+    begin
+        exit(UploadToExternalStorage(DocumentAttachment, FailureReason));
+    end;
+
+    /// <summary>
+    /// Uploads a document attachment to external storage and explains why an upload was not performed.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to upload.</param>
+    /// <param name="FailureReason">Set to the reason the upload failed; empty on success.</param>
+    /// <returns>True if upload was successful, false otherwise.</returns>
+    procedure UploadToExternalStorage(var DocumentAttachment: Record "Document Attachment"; var FailureReason: Text): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+        TempBlob: Codeunit "Temp Blob";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+        OutStream: OutStream;
+        FileName: Text[2048];
+    begin
+        FailureReason := '';
+        Clear(LastCreatedExternalFilePath);
+        LastFailureReasonSafeForTelemetry := false;
+
+        // Check if feature is enabled
+        if not IsFeatureEnabled() then
+            exit(FailWith(FeatureDisabledErr, FailureReason));
+
+        // Validate input parameters
+        if not DocumentAttachment."Document Reference ID".HasValue() then
+            exit(FailWith(NoInternalContentErr, FailureReason));
+
+        // Check if document is already uploaded
+        if DocumentAttachment."External File Path" <> '' then
+            exit(FailWith(AlreadyUploadedErr, FailureReason));
+
+        // Get file content from document attachment
+        TempBlob.CreateOutStream(OutStream);
+        DocumentAttachment.ExportToStream(OutStream);
+        TempBlob.CreateInStream(InStream);
+
+        // Generate unique filename to prevent collisions
+        FileName := GetFilePathWithRootFolder(DocumentAttachment);
+
+        // Search for External Storage assigned File Scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(FailWith(GetNoFileAccountReason(), FailureReason));
+
+        // Create the file with connector using the File Account framework
+        ExternalFileStorage.Initialize(FileScenario);
+        if ExternalFileStorage.CreateFile(FileName, InStream) then begin
+            LastCreatedExternalFilePath := FileName;
+            DocumentAttachment."Stored Externally" := true;
+            DocumentAttachment."External Upload Date" := CurrentDateTime();
+            DocumentAttachment."External File Path" := FileName;
+            DocumentAttachment."Source Environment Hash" := GetCurrentEnvironmentHash();
+            DocumentAttachment.Modify();
+            // SQL stores DateTime with lower precision than CurrentDateTime(); return the persisted row so stale-reference guards match it.
+            DocumentAttachment.GetBySystemId(DocumentAttachment.SystemId);
+            DAFeatureTelemetry.LogFeatureUsed();
+            DAFeatureTelemetry.LogFileUploaded(DocumentAttachment);
+            exit(true);
+        end;
+
+        exit(FailWithLastError(FailureReason));
+    end;
+
+    /// <summary>
+    /// Gets the path created by the last upload attempt.
+    /// </summary>
+    /// <returns>The external file path created by the last upload attempt, or empty if no file was created.</returns>
+    internal procedure GetLastCreatedExternalFilePath(): Text[2048]
+    begin
+        exit(LastCreatedExternalFilePath);
+    end;
+
+    /// <summary>
+    /// Downloads a document attachment from external storage and prompts user to save it locally.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to download.</param>
+    /// <returns>True if download was successful, false otherwise.</returns>
+    procedure DownloadFromExternalStorage(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+        ExternalFilePath, FileName : Text;
+    begin
+        // Check if feature is enabled
+        if not IsFeatureEnabled() then
+            exit(false);
+
+        // Validate input parameters
+        if DocumentAttachment."External File Path" = '' then
+            exit(false);
+
+        if not DocumentAttachment."Stored Externally" then
+            exit(false);
+
+        // Use the stored external file path
+        ExternalFilePath := DocumentAttachment."External File Path";
+        FileName := DocumentAttachment."File Name" + '.' + DocumentAttachment."File Extension";
+
+        // Search for External Storage assigned File Scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(false);
+
+        // Get the file with connector using the File Account framework
+        ExternalFileStorage.Initialize(FileScenario);
+        ExternalFileStorage.GetFile(ExternalFilePath, InStream);
+
+        if DownloadFromStream(InStream, '', '', '', FileName) then begin
+            DAFeatureTelemetry.LogFileDownloaded(DocumentAttachment);
+            exit(true);
+        end;
+
+        exit(false);
+    end;
+
+    /// <summary>
+    /// Downloads a document attachment from external storage and saves it to internal storage.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to download and restore internally.</param>
+    /// <returns>True if download and import was successful, false otherwise.</returns>
+    procedure DownloadFromExternalStorageToInternal(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        FailureReason: Text;
+    begin
+        exit(DownloadFromExternalStorageToInternal(DocumentAttachment, FailureReason));
+    end;
+
+    /// <summary>
+    /// Downloads a document attachment from external storage, saves it to internal storage, and explains why a download was not performed.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to download and restore internally.</param>
+    /// <param name="FailureReason">Set to the reason the download failed; empty on success.</param>
+    /// <returns>True if download and import was successful, false otherwise.</returns>
+    procedure DownloadFromExternalStorageToInternal(var DocumentAttachment: Record "Document Attachment"; var FailureReason: Text): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+        ExternalFilePath, FileName : Text;
+    begin
+        FailureReason := '';
+        LastFailureReasonSafeForTelemetry := false;
+
+        // Validate input parameters
+        if DocumentAttachment."External File Path" = '' then
+            exit(FailWith(NotStoredExternallyErr, FailureReason));
+
+        if not DocumentAttachment."Stored Externally" then
+            exit(FailWith(NotStoredExternallyErr, FailureReason));
+
+        // Use the stored external file path
+        ExternalFilePath := DocumentAttachment."External File Path";
+        FileName := DocumentAttachment."File Name" + '.' + DocumentAttachment."File Extension";
+
+        // Search for External Storage assigned File Scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(FailWith(GetNoFileAccountReason(), FailureReason));
+
+        // Get the file with connector using the File Account framework
+        ExternalFileStorage.Initialize(FileScenario);
+        if not ExternalFileStorage.GetFile(ExternalFilePath, InStream) then
+            exit(FailWithLastError(FailureReason));
+
+        if InStream.EOS() then
+            exit(FailWith(EmptyExternalRestoreErr, FailureReason));
+
+        // Media import also validates the filename, independently of the attachment's display fields.
+        DocumentAttachment.ImportAttachment(InStream, SanitizeFileName(FileName));
+        DocumentAttachment."Stored Internally" := true;
+        DocumentAttachment.Modify();
+
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Downloads a document attachment from external storage to a stream.
+    /// </summary>
+    /// <param name="ExternalFilePath">The path of the external file to download.</param>
+    /// <param name="AttachmentOutStream">The output stream to write the attachment to.</param>
+    /// <returns>True if the download was successful, false otherwise.</returns>
+    procedure DownloadFromExternalStorageToStream(ExternalFilePath: Text; var AttachmentOutStream: OutStream): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+    begin
+        // Search for External Storage assigned File Scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(false);
+
+        // Get the file from external storage
+        ExternalFileStorage.Initialize(FileScenario);
+        if not ExternalFileStorage.GetFile(ExternalFilePath, InStream) then
+            exit(false);
+
+        // Copy to output stream
+        CopyStream(AttachmentOutStream, InStream);
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Downloads a document attachment from external storage to a Temp Blob.
+    /// </summary>
+    /// <param name="ExternalFilePath">The path of the external file to download.</param>
+    /// <param name="TempBlob">The temporary blob to store the downloaded content.</param>
+    /// <returns>True if the download was successful, false otherwise.</returns>
+    procedure DownloadFromExternalStorageToTempBlob(ExternalFilePath: Text; var TempBlob: Codeunit "Temp Blob"): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+        OutStream: OutStream;
+    begin
+        // Search for External Storage assigned File Scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(false);
+
+        // Get the file from external storage
+        ExternalFileStorage.Initialize(FileScenario);
+        if not ExternalFileStorage.GetFile(ExternalFilePath, InStream) then
+            exit(false);
+
+        // Copy to TempBlob
+        TempBlob.CreateOutStream(OutStream);
+        CopyStream(OutStream, InStream);
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Retires a document attachment's local external reference without deleting remote content.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to delete from external storage.</param>
+    /// <returns>True if the local reference was retired, false otherwise.</returns>
+    procedure DeleteFromExternalStorage(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        FailureReason: Text;
+    begin
+        exit(RetireExternalReference(DocumentAttachment, FailureReason));
+    end;
+
+    /// <summary>
+    /// Retires a local external reference through the canonical internal-content guard.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to delete from external storage.</param>
+    /// <param name="FailureReason">Set to the reason retirement was blocked; empty on success.</param>
+    /// <returns>True if the local reference was retired, never if remote content was deleted.</returns>
+    procedure DeleteFromExternalStorage(var DocumentAttachment: Record "Document Attachment"; var FailureReason: Text): Boolean
+    begin
+        exit(RetireExternalReference(DocumentAttachment, FailureReason));
+    end;
+
+    internal procedure RetireExternalReference(var DocumentAttachment: Record "Document Attachment"; var FailureReason: Text): Boolean
+    var
+        CurrentDocumentAttachment: Record "Document Attachment";
+        TenantMedia: Record "Tenant Media";
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+    begin
+        Clear(FailureReason);
+        if DocumentAttachment.IsTemporary() or IsNullGuid(DocumentAttachment.SystemId) then
+            exit(BlockReferenceRetirement(FailureReason, RetirementRecordMissingErr));
+
+        ExternalStorageSetup.ChangeCompany(DocumentAttachment.CurrentCompany());
+        if not ExternalStorageSetup.Get() then
+            exit(BlockReferenceRetirement(FailureReason, RetirementFeatureDisabledErr));
+        if not ExternalStorageSetup.Enabled then
+            exit(BlockReferenceRetirement(FailureReason, RetirementFeatureDisabledErr));
+
+        CurrentDocumentAttachment.ChangeCompany(DocumentAttachment.CurrentCompany());
+        CurrentDocumentAttachment.ReadIsolation(IsolationLevel::UpdLock);
+        if not CurrentDocumentAttachment.GetBySystemId(DocumentAttachment.SystemId) then
+            exit(BlockReferenceRetirement(FailureReason, RetirementRecordMissingErr));
+
+        if not CurrentDocumentAttachment."Stored Externally" or (CurrentDocumentAttachment."External File Path" = '') then
+            exit(BlockReferenceRetirement(FailureReason, RetirementExternalReferenceMissingErr));
+
+        if (CurrentDocumentAttachment.RecordId() <> DocumentAttachment.RecordId()) or
+           (CurrentDocumentAttachment."External File Path" <> DocumentAttachment."External File Path") or
+           (CurrentDocumentAttachment."External Upload Date" <> DocumentAttachment."External Upload Date") or
+           (CurrentDocumentAttachment."Source Environment Hash" <> DocumentAttachment."Source Environment Hash") or
+           (CurrentDocumentAttachment."Document Reference ID".MediaId() <> DocumentAttachment."Document Reference ID".MediaId())
+        then
+            exit(BlockReferenceRetirement(FailureReason, RetirementReferenceChangedErr));
+
+        if not CurrentDocumentAttachment."Stored Internally" or not CurrentDocumentAttachment."Document Reference ID".HasValue() then
+            exit(BlockReferenceRetirement(FailureReason, RetirementInternalContentMissingErr));
+
+        TenantMedia.ReadIsolation(IsolationLevel::UpdLock);
+        if not TenantMedia.Get(CurrentDocumentAttachment."Document Reference ID".MediaId()) then
+            exit(BlockReferenceRetirement(FailureReason, RetirementInternalContentMissingErr));
+
+        TenantMedia.CalcFields(Content);
+        if not TenantMedia.Content.HasValue() or (TenantMedia.Content.Length() = 0) then
+            exit(BlockReferenceRetirement(FailureReason, RetirementInternalContentMissingErr));
+
+        // Both local rows remain locked until the caller commits; no remote operation or implicit commit is involved.
+        CurrentDocumentAttachment.MarkAsNotUploadedToExternal();
+        DAFeatureTelemetry.LogExternalFileRetained(DocumentAttachment, 'LocalReferenceRetired');
+        DocumentAttachment := CurrentDocumentAttachment;
+        exit(true);
+    end;
+
+    local procedure BlockReferenceRetirement(var FailureReason: Text; Reason: Text): Boolean
+    begin
+        FailureReason := Reason;
+        exit(false);
+    end;
+
+    internal procedure GetExternalDeletionBlockedMessage(): Text
+    begin
+        exit(ExternalDeletionBlockedMsg);
+    end;
+
+    /// <summary>
+    /// Deletes a document attachment from internal storage.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to delete from internal storage.</param>
+    /// <returns>True if deletion was successful, false otherwise.</returns>
+    procedure DeleteFromInternalStorage(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        FailureReason: Text;
+    begin
+        exit(DeleteFromInternalStorage(DocumentAttachment, FailureReason));
+    end;
+
+    /// <summary>
+    /// Deletes a document attachment from internal storage and explains why a deletion was not performed.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to delete from internal storage.</param>
+    /// <param name="FailureReason">Set to the reason the deletion failed; empty on success.</param>
+    /// <returns>True if deletion was successful, false otherwise.</returns>
+    procedure DeleteFromInternalStorage(var DocumentAttachment: Record "Document Attachment"; var FailureReason: Text): Boolean
+    var
+        CurrentDocumentAttachment: Record "Document Attachment";
+        TenantMedia: Record "Tenant Media";
+    begin
+        FailureReason := '';
+        LastFailureReasonSafeForTelemetry := false;
+
+        if DocumentAttachment.IsTemporary() or IsNullGuid(DocumentAttachment.SystemId) then
+            exit(FailWith(RetirementRecordMissingErr, FailureReason));
+
+        CurrentDocumentAttachment.ChangeCompany(DocumentAttachment.CurrentCompany());
+        CurrentDocumentAttachment.ReadIsolation(IsolationLevel::UpdLock);
+        if not CurrentDocumentAttachment.GetBySystemId(DocumentAttachment.SystemId) then
+            exit(FailWith(RetirementRecordMissingErr, FailureReason));
+
+        if (CurrentDocumentAttachment.RecordId() <> DocumentAttachment.RecordId()) or
+           (CurrentDocumentAttachment."External File Path" <> DocumentAttachment."External File Path") or
+           (CurrentDocumentAttachment."External Upload Date" <> DocumentAttachment."External Upload Date") or
+           (CurrentDocumentAttachment."Source Environment Hash" <> DocumentAttachment."Source Environment Hash") or
+           (CurrentDocumentAttachment."Document Reference ID".MediaId() <> DocumentAttachment."Document Reference ID".MediaId())
+        then
+            exit(FailWith(RetirementReferenceChangedErr, FailureReason));
+
+        // Validate input parameters
+        if not CurrentDocumentAttachment."Document Reference ID".HasValue() then
+            exit(FailWith(NoInternalContentErr, FailureReason));
+
+        // Check if file is uploaded externally before deleting internally
+        if not CurrentDocumentAttachment."Stored Externally" then
+            exit(FailWith(NotStoredExternallyErr, FailureReason));
+
+        TenantMedia.ReadIsolation(IsolationLevel::UpdLock);
+        if not TenantMedia.Get(CurrentDocumentAttachment."Document Reference ID".MediaId()) then
+            exit(FailWith(InternalContentNotFoundErr, FailureReason));
+
+        // Attachments copied onto other documents share this Tenant Media row, so it may only be
+        // deleted once this attachment is its last owner. Deleting it earlier destroys the content
+        // of every attachment copied from this one.
+        if not IsDocumentReferenceShared(CurrentDocumentAttachment) then
+            TenantMedia.Delete();
+
+        // Mark Document Attachment as Not Stored Internally
+        CurrentDocumentAttachment.MarkAsDeletedInternally();
+        DocumentAttachment := CurrentDocumentAttachment;
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Checks whether more than one document attachment references the same media content.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment whose media reference is checked.</param>
+    /// <returns>True if another document attachment references the same media, false otherwise.</returns>
+    local procedure IsDocumentReferenceShared(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        OtherDocumentAttachment: Record "Document Attachment";
+    begin
+        OtherDocumentAttachment.ChangeCompany(DocumentAttachment.CurrentCompany());
+        OtherDocumentAttachment.SetRange("Document Reference ID", DocumentAttachment."Document Reference ID");
+        exit(OtherDocumentAttachment.Count() > 1);
+    end;
+
+    /// <summary>
+    /// Maps file extensions to their corresponding MIME types.
+    /// </summary>
+    /// <param name="Rec">The document attachment record.</param>
+    /// <param name="ContentType">The content type to set based on the file extension.</param>
+    procedure FileExtensionToContentMimeType(var Rec: Record "Document Attachment"; var ContentType: Text[100])
+    begin
+        // Determine content type based on file extension
+        case LowerCase(Rec."File Extension") of
+            'pdf':
+                ContentType := 'application/pdf';
+            'jpg', 'jpeg':
+                ContentType := 'image/jpeg';
+            'png':
+                ContentType := 'image/png';
+            'gif':
+                ContentType := 'image/gif';
+            'bmp':
+                ContentType := 'image/bmp';
+            'tiff', 'tif':
+                ContentType := 'image/tiff';
+            'doc':
+                ContentType := 'application/msword';
+            'docx':
+                ContentType := 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            'xls':
+                ContentType := 'application/vnd.ms-excel';
+            'xlsx':
+                ContentType := 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+            'ppt':
+                ContentType := 'application/vnd.ms-powerpoint';
+            'pptx':
+                ContentType := 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+            'txt':
+                ContentType := 'text/plain';
+            'xml':
+                ContentType := 'text/xml';
+            'html', 'htm':
+                ContentType := 'text/html';
+            'zip':
+                ContentType := 'application/zip';
+            'rar':
+                ContentType := 'application/x-rar-compressed';
+            else
+                ContentType := 'application/octet-stream';
+        end;
+    end;
+
+    /// <summary>
+    /// Checks if a Document Attachment file is uploaded to external storage and not stored internally.
+    /// </summary>
+    /// <param name="DocumentAttachment">The Document Attachment record to check.</param>
+    /// <returns>True if the file is uploaded and not stored internally, false otherwise.</returns>
+    procedure IsFileUploadedToExternalStorageAndDeletedInternally(var DocumentAttachment: Record "Document Attachment"): Boolean
+    begin
+        if DocumentAttachment."Stored Internally" then
+            exit(false);
+
+        if not DocumentAttachment."Stored Externally" then
+            exit(false);
+
+        if DocumentAttachment."Document Reference ID".HasValue() then
+            exit(false);
+
+        if DocumentAttachment."External File Path" = '' then
+            exit(false);
+        exit(true);
+    end;
+    #endregion
+
+    /// <summary>
+    /// Opens a folder selection dialog for choosing the root folder.
+    /// </summary>
+    /// <returns>The selected folder path, or empty string if cancelled.</returns>
+    procedure SelectRootFolder(): Text
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        SelectFolderPathLbl: Label 'Select Root Folder for Attachments';
+        FileScenario: Enum "File Scenario";
+    begin
+        // Initialize external file storage with the scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit('');
+
+        ExternalFileStorage.Initialize(FileScenario);
+        exit(ExternalFileStorage.SelectAndGetFolderPath('', SelectFolderPathLbl));
+    end;
+
+    local procedure GetFilePathWithRootFolder(DocumentAttachment: Record "Document Attachment"): Text[2048]
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        FileName: Text;
+        RootFolder: Text;
+        TableNameFolder: Text[100];
+        EnvironmentHashFolder: Text[32];
+        FileNamePart: Text;
+        FileNameFormatLbl: Label '%1-%2.%3', Comment = '%1 = File Name, %2 = GUID, %3 = File Extension', Locked = true;
+    begin
+        // Generate unique filename to prevent collisions
+        FileNamePart := StrSubstNo(FileNameFormatLbl, DocumentAttachment."File Name", DelChr(Format(CreateGuid()), '=', '{}'), DocumentAttachment."File Extension");
+        // Sanitize only the path component, preserving the original attachment name and extension.
+        FileNamePart := SanitizeFileName(FileNamePart);
+
+        // Get table name folder (based on the source table of the attachment)
+        TableNameFolder := GetTableNameFolder(DocumentAttachment."Table ID");
+
+        // Get environment hash folder (based on tenant + environment + company)
+        EnvironmentHashFolder := GetCurrentEnvironmentHash();
+
+        // Get root folder from setup if configured
+        if not ExternalStorageSetup.Get() then
+            exit;
+
+        RootFolder := ExternalStorageSetup."Root Folder";
+        if RootFolder <> '' then begin
+            // Ensure root folder ends with a separator
+            if not RootFolder.EndsWith('/') and not RootFolder.EndsWith('\') then
+                RootFolder := RootFolder + '/';
+
+            // Ensure environment hash folder exists
+            EnsureFolderExists(RootFolder + EnvironmentHashFolder);
+
+            // Ensure environment hash folder exists within table folder
+            EnsureFolderExists(RootFolder + EnvironmentHashFolder + '/' + TableNameFolder);
+
+            FileName := RootFolder + EnvironmentHashFolder + '/' + TableNameFolder + '/' + FileNamePart;
+        end else begin
+            // No root folder, add environment folder at root level
+            EnsureFolderExists(EnvironmentHashFolder);
+
+            // Ensure environment hash folder exists within table folder
+            EnsureFolderExists(EnvironmentHashFolder + '/' + TableNameFolder);
+
+            FileName := EnvironmentHashFolder + '/' + TableNameFolder + '/' + FileNamePart;
+        end;
+
+        exit(CopyStr(FileName, 1, 2048));
+    end;
+
+    local procedure SanitizeFileName(FileName: Text): Text
+    begin
+        exit(DelChr(FileName, '=', '"''<>/\|'));
+    end;
+
+    local procedure GetTableNameFolder(TableID: Integer): Text[100]
+    var
+        TableName: Text;
+    begin
+        // Try to get table name from metadata, fallback to table ID if not available
+        if not TryGetTableName(TableID, TableName) then
+            TableName := 'Table_' + Format(TableID);
+
+        // Replace invalid characters for folder names
+        TableName := DelChr(TableName, '=', '<>:"''/\|?*');
+        TableName := ConvertStr(TableName, ' ', '_');
+
+        exit(CopyStr(TableName, 1, 100));
+    end;
+
+    [TryFunction]
+    local procedure TryGetTableName(TableID: Integer; var TableName: Text)
+    var
+        RecRef: RecordRef;
+    begin
+        // Open the RecordRef to get table metadata
+        // This will fail if the table no longer exists (e.g., after uninstalling a 3rd party app)
+        RecRef.Open(TableID, false);
+        TableName := RecRef.Name;
+        RecRef.Close();
+    end;
+
+    local procedure EnsureFolderExists(CompanyFolderPath: Text)
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        FileScenario: Enum "File Scenario";
+    begin
+        // Initialize external file storage with the scenario
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit;
+
+        ExternalFileStorage.Initialize(FileScenario);
+
+        // Check if directory exists, if not create it
+        if not ExternalFileStorage.DirectoryExists(CompanyFolderPath) then
+            ExternalFileStorage.CreateDirectory(CompanyFolderPath);
+    end;
+
+    /// <summary>
+    /// Gets the current environment hash for use in folder structure.
+    /// </summary>
+    /// <returns>The hash value</returns>
+    procedure GetCurrentEnvironmentHash(): Text[32]
+    var
+        Company: Record Company;
+        EnvironmentInformation: Codeunit "Environment Information";
+        CryptographyManagement: Codeunit "Cryptography Management";
+        HashAlgorithmType: Option MD5,SHA1,SHA256,SHA384,SHA512;
+        IdentityString: Text;
+    begin
+        Company.Get(CompanyName());
+
+        // Combine Tenant ID + Environment Name + Company System ID
+        IdentityString := TenantId() + '|' + EnvironmentInformation.GetEnvironmentName() + '|' + Format(Company.SystemId);
+
+        // Generate MD5 hash (32 characters)
+        exit(CopyStr(CryptographyManagement.GenerateHash(IdentityString, HashAlgorithmType::MD5), 1, 32));
+    end;
+
+    /// <summary>
+    /// Checks if a file belongs to another environment or company.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to check.</param>
+    /// <returns>True if the file is from another environment or company, false otherwise.</returns>
+    procedure IsFileFromAnotherEnvironmentOrCompany(DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        CurrentEnvironmentHash: Text[32];
+    begin
+        // If no source environment hash is set, assume it belongs to current environment
+        if DocumentAttachment."Source Environment Hash" = '' then
+            exit(false);
+
+        CurrentEnvironmentHash := GetCurrentEnvironmentHash();
+        exit(DocumentAttachment."Source Environment Hash" <> CurrentEnvironmentHash);
+    end;
+
+    /// <summary>
+    /// Migrates a file from a previous environment or company folder to the current one.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record to migrate.</param>
+    /// <returns>True if migration was successful, false otherwise.</returns>
+    procedure MigrateFileToCurrentEnvironment(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        TempFileAccount: Record "File Account";
+        ExternalFileStorage: Codeunit "External File Storage";
+        FileScenarioCU: Codeunit "File Scenario";
+        TempBlob: Codeunit "Temp Blob";
+        FileScenario: Enum "File Scenario";
+        InStream: InStream;
+        OutStream: OutStream;
+        OldFilePath: Text;
+        NewFilePath: Text[2048];
+    begin
+        if not DocumentAttachment."Stored Externally" then
+            exit(false);
+
+        if DocumentAttachment."External File Path" = '' then
+            exit(false);
+
+        // Initialize external file storage
+        FileScenario := FileScenario::"Doc. Attach. - External Storage";
+        if not FileScenarioCU.GetSpecificFileAccount(FileScenario, TempFileAccount) then
+            exit(false);
+
+        ExternalFileStorage.Initialize(FileScenario);
+
+        // Download file from old location
+        OldFilePath := DocumentAttachment."External File Path";
+        if not ExternalFileStorage.GetFile(OldFilePath, InStream) then
+            exit(false);
+
+        // Copy to TempBlob
+        TempBlob.CreateOutStream(OutStream);
+        CopyStream(OutStream, InStream);
+        TempBlob.CreateInStream(InStream);
+
+        // Generate new file path in current company folder
+        NewFilePath := GetFilePathWithRootFolder(DocumentAttachment);
+
+        // Upload to new location
+        if not ExternalFileStorage.CreateFile(NewFilePath, InStream) then
+            exit(false);
+
+        // Update document attachment record
+        DocumentAttachment."External File Path" := NewFilePath;
+        DocumentAttachment."Source Environment Hash" := GetCurrentEnvironmentHash();
+        DocumentAttachment."External Upload Date" := CurrentDateTime();
+        DocumentAttachment.Modify();
+
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Runs migration for all document attachments from a previous company.
+    /// </summary>
+    /// <returns>Number of files migrated.</returns>
+    procedure RunCompanyMigration(): Integer
+    var
+        DocumentAttachment: Record "Document Attachment";
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+        MigratedCount: Integer;
+        StartMigrationQst: Label 'This will migrate all document attachments from the previous company folder to the current company folder.\\Do you want to continue?';
+        MigrationCompletedMsg: Label '%1 file(s) have been successfully migrated to the current company folder.', Comment = '%1 = Number of files';
+    begin
+        if not Confirm(StartMigrationQst, false) then
+            exit(0);
+
+        MigratedCount := 0;
+        DocumentAttachment.SetRange("Stored Externally", true);
+        DocumentAttachment.SetFilter("External File Path", '<>%1', '');
+        if DocumentAttachment.FindSet(true) then
+            repeat
+                if IsFileFromAnotherEnvironmentOrCompany(DocumentAttachment) then
+                    if MigrateFileToCurrentEnvironment(DocumentAttachment) then
+                        MigratedCount += 1;
+            until DocumentAttachment.Next() = 0;
+
+        if MigratedCount > 0 then begin
+            DAFeatureTelemetry.LogCompanyMigration();
+            Message(MigrationCompletedMsg, MigratedCount);
+        end;
+
+        exit(MigratedCount);
+    end;
+
+    #region Document Attachment Handling
+    /// <summary>
+    /// Handles automatic upload of new document attachments to external storage upon insertion of the attachment record.
+    /// </summary>
+    /// <param name="Rec">The document attachment record.</param>
+    /// <param name="RunTrigger">Indicates if the trigger should run.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnAfterInsertEvent, '', true, true)]
+    local procedure OnAfterInsertDocumentAttachment(var Rec: Record "Document Attachment"; RunTrigger: Boolean)
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+        ExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // Exit early if trigger is not running
+        if not RunTrigger then
+            exit;
+
+        // Temporary records are not processed
+        if Rec.IsTemporary() then
+            exit;
+
+        // Check if auto upload is enabled
+        if not ExternalStorageSetup.Get() then
+            exit;
+
+        // Only process files with actual content
+        if not Rec."Document Reference ID".HasValue() then
+            exit;
+
+        // Upload to external storage
+        if not ExternalStorageImpl.UploadToExternalStorage(Rec) then
+            exit;
+
+        ExternalStorageImpl.DeleteFromInternalStorage(Rec);
+    end;
+
+    /// <summary>
+    /// Logs retained remote content after deletion of an eligible attachment record.
+    /// </summary>
+    /// <param name="Rec">The document attachment record.</param>
+    /// <param name="RunTrigger">Indicates if the trigger should run.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnAfterDeleteEvent, '', true, true)]
+    local procedure OnAfterDeleteDocumentAttachment(var Rec: Record "Document Attachment"; RunTrigger: Boolean)
+    var
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+    begin
+        // Exit early if trigger is not running
+        if not RunTrigger then
+            exit;
+
+        if not ShouldLogExternalFileRetentionOnRecordDelete(Rec) then
+            exit;
+
+        DAFeatureTelemetry.LogExternalFileRetained(Rec, 'RecordDelete');
+    end;
+
+    /// <summary>
+    /// Evaluates whether retained external content should be logged for a deleted attachment row.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record carrying the field values from the deleted row.</param>
+    /// <returns>True if the previous deletion policy requested cleanup; otherwise false.</returns>
+    local procedure ShouldLogExternalFileRetentionOnRecordDelete(var DocumentAttachment: Record "Document Attachment"): Boolean
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+    begin
+        if DocumentAttachment.IsTemporary() then
+            exit(false);
+
+        // Check if auto delete is enabled
+        if not ExternalStorageSetup.Get() then
+            exit(false);
+
+        if not ExternalStorageSetup."Delete from External Storage" then
+            exit(false);
+
+        // Only process files that were uploaded to external storage
+        if not DocumentAttachment."Stored Externally" then
+            exit(false);
+
+        if DocumentAttachment."External File Path" = '' then
+            exit(false);
+
+        // Copied attachments share the source file - never delete the shared blob
+        if DocumentAttachment."Skip Delete On Copy" then
+            exit(false);
+
+        // Files from another environment/company are managed by their owning environment
+        if IsFileFromAnotherEnvironmentOrCompany(DocumentAttachment) then
+            exit(false);
+
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Handles exporting document attachment content to a stream for externally stored attachments.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record.</param>
+    /// <param name="AttachmentOutStream">The output stream for the attachment content.</param>
+    /// <param name="IsHandled">Indicates if the event has been handled.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnBeforeExportToStream, '', false, false)]
+    local procedure DocumentAttachment_OnBeforeExportToStream(var DocumentAttachment: Record "Document Attachment"; var AttachmentOutStream: OutStream; var IsHandled: Boolean)
+    var
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+        ExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // Only handle if file is uploaded externally and not available internally
+        if not ExternalStorageImpl.IsFileUploadedToExternalStorageAndDeletedInternally(DocumentAttachment) then
+            exit;
+
+        ClearLastError();
+        if not ExternalStorageImpl.DownloadFromExternalStorageToStream(DocumentAttachment."External File Path", AttachmentOutStream) then begin
+            DAFeatureTelemetry.LogFileDownloadFailed(DocumentAttachment, GetLastErrorText(true), GetLastErrorCallStack());
+            Error(CannotRetrieveExternalFileErr, DocumentAttachment."File Name" + '.' + DocumentAttachment."File Extension");
+        end;
+        IsHandled := true;
+    end;
+
+    /// <summary>
+    /// Handles getting the temporary blob for externally stored document attachments.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record.</param>
+    /// <param name="TempBlob">The temporary blob to be filled.</param>
+    /// <param name="IsHandled">Indicates if the event has been handled.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnBeforeGetAsTempBlob, '', false, false)]
+    local procedure DocumentAttachment_OnBeforeGetAsTempBlob(var DocumentAttachment: Record "Document Attachment"; var TempBlob: Codeunit "Temp Blob"; var IsHandled: Boolean)
+    var
+        DAFeatureTelemetry: Codeunit "DA Feature Telemetry";
+        ExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // Only handle if file is uploaded externally and not available internally
+        if not ExternalStorageImpl.IsFileUploadedToExternalStorageAndDeletedInternally(DocumentAttachment) then
+            exit;
+
+        ClearLastError();
+        if not ExternalStorageImpl.DownloadFromExternalStorageToTempBlob(DocumentAttachment."External File Path", TempBlob) then begin
+            DAFeatureTelemetry.LogFileDownloadFailed(DocumentAttachment, GetLastErrorText(true), GetLastErrorCallStack());
+            Error(CannotRetrieveExternalFileErr, DocumentAttachment."File Name" + '.' + DocumentAttachment."File Extension");
+        end;
+        IsHandled := true;
+    end;
+
+    /// <summary>
+    /// Handles getting content type for externally stored document attachments.
+    /// </summary>
+    /// <param name="Rec">The document attachment record.</param>
+    /// <param name="ContentType">The content type to be set.</param>
+    /// <param name="IsHandled">Indicates if the event has been handled.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnBeforeGetContentType, '', false, false)]
+    local procedure DocumentAttachment_OnBeforeGetContentType(var Rec: Record "Document Attachment"; var ContentType: Text[100]; var IsHandled: Boolean)
+    var
+        ExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // Only handle if file is uploaded externally and not available internally
+        if not ExternalStorageImpl.IsFileUploadedToExternalStorageAndDeletedInternally(Rec) then
+            exit;
+
+        ExternalStorageImpl.FileExtensionToContentMimeType(Rec, ContentType);
+        IsHandled := true;
+    end;
+
+    /// <summary>
+    /// Handles checking if attachment content is available for externally stored document attachments.
+    /// Uses the persisted external storage metadata to avoid remote calls when pages evaluate attachment actions.
+    /// The external file and account are validated when the attachment is retrieved, and retrieval failures are surfaced then.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record.</param>
+    /// <param name="AttachmentIsAvailable">Indicates if the attachment is available.</param>
+    /// <param name="IsHandled">Indicates if the event has been handled.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnBeforeHasContent, '', false, false)]
+    local procedure DocumentAttachment_OnBeforeHasContent(var DocumentAttachment: Record "Document Attachment"; var AttachmentIsAvailable: Boolean; var IsHandled: Boolean)
+    var
+        ExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // Only handle if file is uploaded externally and not available internally
+        if not ExternalStorageImpl.IsFileUploadedToExternalStorageAndDeletedInternally(DocumentAttachment) then
+            exit;
+
+        AttachmentIsAvailable := true;
+        IsHandled := true;
+    end;
+
+    /// <summary>
+    /// Event handler for before checking Document Reference ID on insert.
+    /// </summary>
+    /// <param name="DocumentAttachment">The document attachment record.</param>
+    /// <param name="IsHandled">Indicates if the event has been handled.</param>
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnInsertOnBeforeCheckDocRefID, '', false, false)]
+    local procedure "Document Attachment_OnInsertOnBeforeCheckDocRefID"(var DocumentAttachment: Record "Document Attachment"; var IsHandled: Boolean)
+    begin
+        if DocumentAttachment."Stored Externally" then
+            IsHandled := true;
+    end;
+
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Document Attachment Mgmt", OnCopyAttachmentsOnAfterSetToDocumentFilters, '', false, false)]
+    local procedure "Document Attachment Mgmt_OnCopyAttachmentsOnAfterSetToDocumentFilters"(var ToDocumentAttachment: Record "Document Attachment"; ToRecRef: RecordRef; ToAttachmentDocumentType: Enum "Attachment Document Type"; ToNo: Code[20]; ToLineNo: Integer)
+    begin
+        ToDocumentAttachment."Skip Delete On Copy" := ToDocumentAttachment."Stored Externally";
+    end;
+
+    [EventSubscriber(ObjectType::Table, Database::"Document Attachment", OnBeforeOpenInOneDrive, '', false, false)]
+    local procedure "Document Attachment_OnBeforeOpenInOneDrive"(var Rec: Record "Document Attachment"; var IsHandled: Boolean)
+    var
+        NotSupportedErr: Label 'Opening Document Attachments stored in External Storage via OneDrive is not supported.';
+    begin
+        if Rec."Stored Externally" then begin
+            IsHandled := true;
+            Error(NotSupportedErr);
+        end;
+    end;
+    #endregion
+
+    local procedure IsFeatureEnabled(): Boolean
+    var
+        ExternalStorageSetup: Record "DA External Storage Setup";
+    begin
+        if not ExternalStorageSetup.Get() then
+            exit(false);
+
+        exit(ExternalStorageSetup.Enabled);
+    end;
+
+    local procedure FailWith(Reason: Text; var FailureReason: Text): Boolean
+    begin
+        // Precondition failures have no platform error; clear any stale one so it is not reported instead.
+        ClearLastError();
+        FailureReason := Reason;
+        LastFailureReasonSafeForTelemetry := true;
+        exit(false);
+    end;
+
+    local procedure FailWithLastError(var FailureReason: Text): Boolean
+    begin
+        LastFailureReasonSafeForTelemetry := false;
+        FailureReason := GetLastErrorText();
+        if FailureReason = '' then
+            FailureReason := ExternalOperationFailedErr;
+        exit(false);
+    end;
+
+    internal procedure CanLogLastFailureReasonToTelemetry(): Boolean
+    begin
+        exit(LastFailureReasonSafeForTelemetry);
+    end;
+
+    local procedure GetNoFileAccountReason(): Text
+    begin
+        exit(StrSubstNo(NoFileAccountErr, Format(Enum::"File Scenario"::"Doc. Attach. - External Storage")));
+    end;
+}

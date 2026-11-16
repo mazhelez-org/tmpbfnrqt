@@ -1,0 +1,270 @@
+// ------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+// ------------------------------------------------------------------------------------------------
+
+namespace System.Environment;
+
+using System;
+using System.DataAdministration;
+using System.Environment.Configuration;
+
+codeunit 3702 "Environment Information Impl."
+{
+    Access = Internal;
+    SingleInstance = true;
+    InherentEntitlements = X;
+    InherentPermissions = X;
+    Permissions = tabledata "Environment Information" = rimd;
+
+    var
+        NavTenantSettingsHelper: DotNet NavTenantSettingsHelper;
+        TestabilitySoftwareAsAService: Boolean;
+        TestabilitySandbox: Boolean;
+        TestabilityPreview: Boolean;
+        TestabilityEarlyPreview: Boolean;
+        IsSaasInitialized: Boolean;
+        IsSaaSConfig: Boolean;
+        IsSandboxConfig: Boolean;
+        IsSandboxInitialized: Boolean;
+        DefaultSandboxEnvironmentNameTxt: Label 'Sandbox', Locked = true;
+        DefaultProductionEnvironmentNameTxt: Label 'Production', Locked = true;
+
+    procedure IsProduction(): Boolean
+    begin
+        exit(NavTenantSettingsHelper.IsProduction())
+    end;
+
+    procedure IsSandbox(): Boolean
+    begin
+        if TestabilitySandbox then
+            exit(true);
+
+        if not IsSandboxInitialized then begin
+            IsSandboxConfig := NavTenantSettingsHelper.IsSandbox();
+            IsSandboxInitialized := true;
+        end;
+        exit(IsSandboxConfig);
+    end;
+
+    procedure GetEnvironmentName(): Text
+    var
+        EnvironmentName: Text;
+    begin
+        EnvironmentName := NavTenantSettingsHelper.GetEnvironmentName();
+        if EnvironmentName <> '' then
+            exit(EnvironmentName);
+
+        if IsProduction() then
+            exit(DefaultProductionEnvironmentNameTxt);
+
+        exit(DefaultSandboxEnvironmentNameTxt);
+    end;
+
+    procedure GetEnvironmentDescription(): Text
+    var
+        EnvironmentInformation: Record "Environment Information";
+        DescriptionInStream: InStream;
+    begin
+        if not EnvironmentInformation.Get() then
+            exit('');
+
+        EnvironmentInformation.CalcFields(Description);
+        if not EnvironmentInformation.Description.HasValue() then
+            exit('');
+
+        EnvironmentInformation.Description.CreateInStream(DescriptionInStream, GetTextEncoding());
+        exit(ReadText(DescriptionInStream));
+    end;
+
+    procedure SetEnvironmentDescription(Description: Text)
+    var
+        EnvironmentInformation: Record "Environment Information";
+        DescriptionOutStream: OutStream;
+    begin
+        GetEnvironmentInformationSafe(EnvironmentInformation);
+        Clear(EnvironmentInformation.Description);
+        EnvironmentInformation.Description.CreateOutStream(DescriptionOutStream, GetTextEncoding());
+        DescriptionOutStream.WriteText(Description);
+        EnvironmentInformation.Modify();
+    end;
+
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"System Action Triggers", 'GetEnvironmentDescription', '', false, false)]
+    local procedure OnGetEnvironmentDescription(var Description: Text)
+    begin
+        Description := GetEnvironmentDescription();
+    end;
+
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Environment Cleanup", OnClearDatabaseConfig, '', false, false)]
+    local procedure ClearEnvironmentDescriptionOnEnvironmentCopy(SourceEnv: Enum "Environment Type"; DestinationEnv: Enum "Environment Type")
+    var
+        EnvironmentInformation: Record "Environment Information";
+    begin
+        GetEnvironmentInformationSafe(EnvironmentInformation);
+        Clear(EnvironmentInformation.Description);
+        EnvironmentInformation.Modify();
+    end;
+
+    procedure SetTestabilitySandbox(EnableSandboxForTest: Boolean)
+    begin
+        TestabilitySandbox := EnableSandboxForTest;
+    end;
+
+    procedure SetTestabilitySoftwareAsAService(EnableSoftwareAsAServiceForTest: Boolean)
+    begin
+        TestabilitySoftwareAsAService := EnableSoftwareAsAServiceForTest;
+    end;
+
+    procedure IsSaaS(): Boolean
+    var
+        ServerSettings: Codeunit "Server Setting";
+    begin
+        if TestabilitySoftwareAsAService then
+            exit(true);
+
+        if not IsSaasInitialized then begin
+            IsSaaSConfig := IsSandbox() or ServerSettings.GetEnableMembershipEntitlement();
+            IsSaasInitialized := true;
+        end;
+
+        exit(IsSaaSConfig);
+    end;
+
+    procedure IsSaaSInfrastructure(): Boolean
+    var
+        UserAccountHelper: DotNet NavUserAccountHelper;
+    begin
+        if TestabilitySoftwareAsAService then
+            exit(true);
+
+        exit(IsSaaS() and UserAccountHelper.IsAzure());
+    end;
+
+    procedure IsOnPrem(): Boolean
+    begin
+        exit(GetAppId() = 'NAV');
+    end;
+
+    procedure IsFinancials(): Boolean
+    begin
+        exit(GetAppId() = 'FIN');
+    end;
+
+    procedure GetApplicationFamily(): Text
+    begin
+        exit(NavTenantSettingsHelper.GetApplicationFamily());
+    end;
+
+    procedure IsPreview(): Boolean
+    begin
+        if TestabilityPreview then
+            exit(true);
+        exit(NavTenantSettingsHelper.GetRingName() = 'PREVIEW');
+    end;
+
+    procedure SetTestabilityPreview(EnablePreviewForTest: Boolean)
+    begin
+        TestabilityPreview := EnablePreviewForTest;
+    end;
+
+    procedure IsEarlyPreview(): Boolean
+    var
+        RingName: Text;
+    begin
+        if TestabilityEarlyPreview then
+            exit(true);
+        RingName := NavTenantSettingsHelper.GetRingName();
+        exit((RingName = 'EARLYPREVIEW') or (RingName = 'EARLYPREV'));
+    end;
+
+    procedure SetTestabilityEarlyPreview(EnableEarlyPreviewForTest: Boolean)
+    begin
+        TestabilityEarlyPreview := EnableEarlyPreviewForTest;
+    end;
+
+    procedure VersionInstalled(AppID: Guid): Integer
+    var
+        AppInfo: ModuleInfo;
+    begin
+        NavApp.GetModuleInfo(AppID, AppInfo);
+        exit(AppInfo.DataVersion.Major());
+    end;
+
+    procedure CanStartSession(): Boolean
+    var
+        NavTestExecution: DotNet NavTestExecution;
+    begin
+        if GetExecutionContext() in [ExecutionContext::Install, ExecutionContext::Upgrade] then
+            exit(false);
+
+        // Sessions cannot be started in tests if test isolation is enabled
+        // 1) check that a test is indeed being executed (so the current user is not delegated admin / device / GDAP guest user)
+        if NavTestExecution.IsInTestMode() then
+            // 2) check for test isolation
+            exit(TaskScheduler.CanCreateTask());
+
+        exit(true);
+    end;
+
+    procedure EnableM365Collaboration()
+    begin
+        NavTenantSettingsHelper.EnableM365Collaboration();
+    end;
+
+    local procedure GetAppId() AppId: Text
+    begin
+        OnBeforeGetApplicationIdentifier(AppId);
+        if AppId = '' then
+            AppId := ApplicationIdentifier();
+    end;
+
+    procedure GetLinkedPowerPlatformEnvironmentId(): Text
+    begin
+        exit(NavTenantSettingsHelper.GetLinkedPowerPlatformEnvironmentId());
+    end;
+
+    procedure GetEnvironmentSetting(SettingName: Text; ModuleInfo: ModuleInfo): Text
+    begin
+        if ModuleInfo.Publisher <> 'Microsoft' then
+            exit('');
+        exit(NavTenantSettingsHelper.GetEnvironmentApplicationSetting(SettingName));
+    end;
+
+    local procedure GetEnvironmentInformationSafe(var EnvironmentInformation: Record "Environment Information")
+    begin
+        if EnvironmentInformation.Get() then
+            exit;
+
+        EnvironmentInformation.Insert();
+        EnvironmentInformation.Find();
+    end;
+
+    local procedure ReadText(Input: InStream): Text
+    var
+        TextBuilder: TextBuilder;
+        TextLine: Text;
+        FirstLine: Boolean;
+    begin
+        FirstLine := true;
+        while not Input.EOS() do begin
+            Input.ReadText(TextLine);
+            if not FirstLine then
+                TextBuilder.AppendLine('');
+            TextBuilder.Append(TextLine);
+            FirstLine := false;
+        end;
+        exit(TextBuilder.ToText());
+    end;
+
+    local procedure GetTextEncoding(): TextEncoding
+    begin
+        exit(TextEncoding::UTF8);
+    end;
+
+    [InternalEvent(false)]
+    procedure OnBeforeGetApplicationIdentifier(var AppId: Text)
+    begin
+        // An event which asks for the AppId to be filled in by the subscriber.
+        // Do not use this event in a production environment. This should be subscribed to only in tests.
+    end;
+}

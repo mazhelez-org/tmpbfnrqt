@@ -1,0 +1,204 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go/a946346885b3c762fcbadb265823e70150c3e2f1/Actions/.Modules/settings.schema.json",
+  "type": "PTE",
+  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@preview",
+  "bcContainerHelperVersion": "preview",
+  "runs-on": "windows-latest",
+  "cacheImageName": "",
+  "UsePsSession": true,
+  "usePsSessionForBc28": true,
+  "gitHubRunner": "windows-latest",
+  "githubRunnerShell": "pwsh",
+  "artifact": "bcinsider/Sandbox/30.0.58029.0//latest",
+  "country": "base",
+  "useProjectDependencies": true,
+  "skipDraftPullRequests": true,
+  "repoVersion": "30.0",
+  "memoryLimit": "16G",
+  "numberOfTenantsForTesting": 4,
+  "enableCleanTestCodeunitExecution": true,
+  "maxTestAppReruns": 2,
+  "failOn": "newWarning",
+  "workspaceCompilation": {
+    "enabled": true,
+    "parallelism": -1
+  },
+  "conditionalSettings": [
+    {
+      "buildModes": [
+        "Clean"
+      ],
+      "settings": {
+        "preprocessorSymbols": [
+          "CLEAN25",
+          "CLEAN26",
+          "CLEAN27",
+          "CLEAN28",
+          "CLEAN29",
+          "CLEAN30"
+        ]
+      }
+    },
+    {
+      "buildModes": [
+        "UncategorizedTests"
+      ],
+      "settings": {
+        "enableTaskScheduler": true
+      }
+    },
+    {
+      "buildModes": [
+        "LegacyTestsBucket1"
+      ],
+      "settings": {
+        "additionalDemoDataTypes": [
+          "Standard",
+          "Evaluation"
+        ]
+      }
+    },
+    {
+      "projects": [
+        "."
+      ],
+      "settings": {
+        "appFolders": [
+          "src/Layers/W1/DemoTool"
+        ]
+      }
+    }
+  ],
+  "customALGoFiles": {
+    "filesToExclude": [
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "AddExistingAppOrTestApp.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "CreateApp.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "CreateOnlineDevelopmentEnvironment.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "CreatePerformanceTestApp.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "CreateRelease.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "CreateTestApp.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "Current.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "NextMajor.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "NextMinor.yaml"
+      },
+      {
+        "sourceFolder": ".github/workflows",
+        "filter": "PublishToEnvironment.yaml"
+      },
+      {
+        "sourceFolder": ".github",
+        "filter": "Test Current.settings.json"
+      },
+      {
+        "sourceFolder": ".github",
+        "filter": "Test Next Minor.settings.json"
+      },
+      {
+        "sourceFolder": ".github",
+        "filter": "Test Next Major.settings.json"
+      }
+    ]
+  },
+  "excludeEnvironments": [
+    "Official-Build"
+  ],
+  "buildModes": [
+    "Default"
+  ],
+  "CICDPushBranches": [
+    "main",
+    "releases/*"
+  ],
+  "CICDPullRequestBranches": [
+    "main",
+    "releases/*",
+    "features/*"
+  ],
+  "enableCodeCop": true,
+  "enableAppSourceCop": true,
+  "enablePerTenantExtensionCop": true,
+  "enableUICop": true,
+  "enableCodeAnalyzersOnTestApps": true,
+  "BCQuality": {
+    "version": "1.9",
+    "enabledLayers": [
+      "microsoft"
+    ]
+  },
+  "CodeReviewAgent": {
+    "enabled": true,
+    "branches": [
+      "main"
+    ],
+    "excludedAuthors": [
+      "business-central-bot[bot]",
+      "dependabot[bot]"
+    ]
+  },
+  "rulesetFile": "../../../src/rulesets/base.ruleset.json",
+  "skipUpgrade": true,
+  "fullBuildPatterns": [
+    "build/*",
+    "src/rulesets/*",
+    "src/Layers/*",
+    "src/DisabledTests/*",
+    ".github/workflows/PullRequestHandler.yaml",
+    ".github/workflows/_BuildALGoProject.yaml"
+  ],
+  "PullRequestTrigger": "pull_request",
+  "ALDoc": {
+    "maxReleases": 0,
+    "continuousDeployment": false,
+    "groupByProject": false,
+    "includeProjects": [
+      "build_projects_Apps W1"
+    ],
+    "excludeProjects": [
+      "build_projects_System Application Modules"
+    ]
+  },
+  "UpdateALGoSystemFilesEnvironment": "Official-Build",
+  "templateSha": "fb1274920d226ed93c592d08218b77c64a01b195",
+  "commitOptions": {
+    "messageSuffix": "Related to AB#640900",
+    "pullRequestAutoMerge": true,
+    "pullRequestLabels": [
+      "Automation"
+    ]
+  },
+  "runNumberOffset": 60000,
+  "shortLivedArtifactsRetentionDays": 3,
+  "incrementalBuilds": {
+    "onPush": false,
+    "onPull_Request": true,
+    "onSchedule": false,
+    "mode": "modifiedApps"
+  },
+  "MicrosoftTelemetryConnectionString": ""
+}

@@ -1,0 +1,53 @@
+name: 'PowerShell'
+
+on:
+  push:
+    branches: [ "main", "releases/*" ]
+    paths: ["**.ps1", "**.psm1", "**.psd1", ".github/workflows/powershell.yaml" ]
+  pull_request:
+    branches: [ "main", "releases/*" ]
+    paths: ["**.ps1", "**.psm1", "**.psd1", ".github/workflows/powershell.yaml" ]
+
+permissions:
+  contents: read
+
+jobs:
+  PSScriptAnalyzer:
+    # https://github.com/microsoft/psscriptanalyzer-action
+    # For more information on PSScriptAnalyzer in general, see
+    # https://github.com/PowerShell/PSScriptAnalyzer
+    name: Run PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run PSScriptAnalyzer
+        uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f # v1.1
+        with:
+          path: .\
+          recurse: true
+          excludeRule: '"PSAvoidUsingInvokeExpression", "PSUseShouldProcessForStateChangingFunctions", "PSAvoidUsingWriteHost", "PSAvoidUsingCmdletAliases", "PSUseSingularNouns", "PSUseApprovedVerbs"'
+          output: results.sarif
+
+      # Upload the SARIF file generated in the previous step
+      - name: Upload SARIF results file
+        uses: github/codeql-action/upload-sarif@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v3.30.8
+        with:
+          sarif_file: results.sarif
+
+  RunTests:
+    name: Run PS Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run PS Tests
+        run: |
+          . (Join-Path "." "build/scripts/tests/runTests.ps1")

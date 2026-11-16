@@ -1,0 +1,136 @@
+// ------------------------------------------------------------------------------------------------
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+// ------------------------------------------------------------------------------------------------
+namespace Microsoft.Manufacturing.Subcontracting;
+
+using Microsoft.Inventory.Requisition;
+using Microsoft.Manufacturing.Setup;
+
+codeunit 20503 "Subcontracting Comp. Init."
+{
+    var
+        ReqWkshTempDescLbl: Label 'Subcontracting', MaxLength = 80;
+        ReqWkshTempNameLbl: Label 'SUBCONTR', MaxLength = 10;
+        ReqWkshDescLbl: Label 'Subcontracting', MaxLength = 100;
+        ReqWkshNameLbl: Label 'SUBCONTR', MaxLength = 10;
+        DefaultCompTransferLeadTimeLbl: Label '<1D>', Locked = true;
+
+    procedure CreateBasicSubcontractingMgtSetup()
+    begin
+        InitializeManufacturingSetupDefaults();
+    end;
+
+    local procedure InitializeManufacturingSetupDefaults()
+    var
+        ManufacturingSetup: Record "Manufacturing Setup";
+        InitializeDefaults: Boolean;
+    begin
+        if not ManufacturingSetup.Get() then begin
+            ManufacturingSetup.Init();
+            ManufacturingSetup.Insert(true);
+        end;
+
+        InitializeDefaults := IsSubcontractingSetupUninitialized(ManufacturingSetup);
+        if not CreateSubcontractingReqWkshTemplateAndNameAndUpdateSetup(ManufacturingSetup) then
+            exit;
+
+        if InitializeDefaults then begin
+            ManufacturingSetup."Create Prod. Order Info Line" := true;
+            Evaluate(ManufacturingSetup."Subc. Comp. Transfer Lead Time", GetDefaultCompTransferLeadTime());
+        end;
+        ManufacturingSetup.Modify(true);
+    end;
+
+    local procedure IsSubcontractingSetupUninitialized(ManufacturingSetup: Record "Manufacturing Setup"): Boolean
+    begin
+        // Fully cleared settings are indistinguishable from extension data that has not been initialized.
+        exit((ManufacturingSetup."Subcontracting Template Name" = '') and
+            (ManufacturingSetup."Subcontracting Batch Name" = '') and
+            not ManufacturingSetup."Create Prod. Order Info Line" and
+            (Format(ManufacturingSetup."Subc. Comp. Transfer Lead Time") = '') and
+            (ManufacturingSetup."Component Direct Unit Cost" = ManufacturingSetup."Component Direct Unit Cost"::Standard) and
+            (ManufacturingSetup."Subc. Default Comp. Location" = ManufacturingSetup."Subc. Default Comp. Location"::Empty));
+    end;
+
+    procedure CreateSubcontractingReqWkshTemplateAndNameAndUpdateSetup(var ManufacturingSetup: Record "Manufacturing Setup"): Boolean
+    var
+        ReqWkshTemplate: Record "Req. Wksh. Template";
+        RequisitionWkshName: Record "Requisition Wksh. Name";
+    begin
+        if not ReqWkshTemplate.Get(ManufacturingSetup."Subcontracting Template Name") or
+           (ReqWkshTemplate.Type <> ReqWkshTemplate.Type::Subcontracting)
+        then
+            CreateReqWkshTemplate(ReqWkshTemplate, false);
+
+        UpdateSubcontractingWorksheetPage(ReqWkshTemplate);
+
+        if not RequisitionWkshName.Get(ReqWkshTemplate.Name, ManufacturingSetup."Subcontracting Batch Name") then
+            CreateRequisitionWkshName(RequisitionWkshName, ReqWkshTemplate.Name);
+        ManufacturingSetup."Subcontracting Template Name" := ReqWkshTemplate.Name;
+        ManufacturingSetup."Subcontracting Batch Name" := RequisitionWkshName.Name;
+        exit(true);
+    end;
+
+    procedure CreateReqWkshTemplate(var ReqWkshTemplate: Record "Req. Wksh. Template"; Recurring: Boolean): Boolean
+    begin
+        ReqWkshTemplate.SetRange(Type, ReqWkshTemplate.Type::Subcontracting);
+        if ReqWkshTemplate.FindFirst() then begin
+            UpdateSubcontractingWorksheetPage(ReqWkshTemplate);
+            exit(false);
+        end;
+
+        ReqWkshTemplate.Init();
+        ReqWkshTemplate.Validate(Name, GetAvailableReqWkshTemplateName());
+        ReqWkshTemplate.Validate(Description, ReqWkshTempDescLbl);
+        ReqWkshTemplate.Recurring := Recurring;
+        ReqWkshTemplate.Validate(Type, ReqWkshTemplate.Type::Subcontracting);
+        ReqWkshTemplate.Validate("Page ID", Page::"Subc. Subcontracting Worksheet");
+        ReqWkshTemplate.Insert(true);
+        exit(true);
+    end;
+
+    local procedure GetAvailableReqWkshTemplateName(): Code[10]
+    var
+        ExistingReqWkshTemplate: Record "Req. Wksh. Template";
+        TemplateName: Code[10];
+        SuffixText: Text;
+        Suffix: Integer;
+    begin
+        TemplateName := CopyStr(ReqWkshTempNameLbl, 1, MaxStrLen(TemplateName));
+        while ExistingReqWkshTemplate.Get(TemplateName) do begin
+            Suffix += 1;
+            SuffixText := Format(Suffix, 0, 9);
+            TemplateName := CopyStr(CopyStr(ReqWkshTempNameLbl, 1, MaxStrLen(TemplateName) - StrLen(SuffixText)) + SuffixText, 1, MaxStrLen(TemplateName));
+        end;
+        exit(TemplateName);
+    end;
+
+    local procedure UpdateSubcontractingWorksheetPage(var ReqWkshTemplate: Record "Req. Wksh. Template")
+    begin
+        // The obsolete Subcontracting Worksheet page may no longer be available in symbols.
+        if ReqWkshTemplate."Page ID" <> 99000886 then
+            exit;
+
+        ReqWkshTemplate.Validate("Page ID", Page::"Subc. Subcontracting Worksheet");
+        ReqWkshTemplate.Modify(true);
+    end;
+
+    procedure CreateRequisitionWkshName(var RequisitionWkshName: Record "Requisition Wksh. Name"; WorksheetTemplateName: Text)
+    begin
+        RequisitionWkshName.SetRange("Worksheet Template Name", WorksheetTemplateName);
+        if RequisitionWkshName.FindFirst() then
+            exit;
+
+        RequisitionWkshName.Init();
+        RequisitionWkshName.Validate("Worksheet Template Name", CopyStr(WorksheetTemplateName, 1, MaxStrLen(RequisitionWkshName."Worksheet Template Name")));
+        RequisitionWkshName.Validate(Name, ReqWkshNameLbl);
+        RequisitionWkshName.Description := ReqWkshDescLbl;
+        RequisitionWkshName.Insert(true);
+    end;
+
+    local procedure GetDefaultCompTransferLeadTime(): Text
+    begin
+        exit(DefaultCompTransferLeadTimeLbl);
+    end;
+}
